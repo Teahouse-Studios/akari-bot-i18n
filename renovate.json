@@ -1,0 +1,15 @@
+{
+    "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+    "extends": ["config:recommended"],
+    "ignorePaths": ["**/requirements*.txt"],
+    "pip_requirements": {
+        "managerFilePatterns": ["/^$/"]
+    },
+    "packageRules": [
+        {
+            "matchUpdateTypes": ["minor", "patch", "pin", "digest"],
+            "automerge": true
+        }
+    ],
+    "schedule": ["monthly"]
+}
