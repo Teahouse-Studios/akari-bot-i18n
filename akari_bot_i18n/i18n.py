@@ -1,4 +1,3 @@
-import glob
 import html
 import re
 import traceback
@@ -60,35 +59,25 @@ class LocaleNode:
 locale_root = LocaleNode()
 
 
-def load_locale_file(lang_list: list[str], locales_path: Path, modules_locales_path: Optional[str]=None) -> list[str]:
+def load_locale_file(lang_list: list[str], locales_path: Optional[list[str]]=None) -> list[str]:
     supported_locales.extend(lang_list)
     locale_dict = {}
     err_prompt = []
 
-    locales = [c.name for c in locales_path.iterdir()]
-    try:
-        for loc in locales:
-            with open(locales_path / loc, "rb") as f:
-                locale_dict[loc.removesuffix(".json")] = flatten(orjson.loads(f.read()))
-    except Exception as e:
-        traceback.print_exc()
-        err_prompt.append(str(e))
-
-    if modules_locales_path:
-        for modules_locales_file in glob.glob(modules_locales_path):
-            if Path(modules_locales_file).is_dir():
-                locales_m = [c.name for c in Path(modules_locales_file).iterdir()]
-                for lang_file in locales_m:
-                    lang_file_path = Path(modules_locales_file) / lang_file
-                    with open(lang_file_path, "rb") as f:
-                        try:
-                            if lang_file.removesuffix(".json") in locale_dict:
-                                locale_dict[lang_file.removesuffix(".json")].update(flatten(orjson.loads(f.read())))
-                            else:
-                                locale_dict[lang_file.removesuffix(".json")] = flatten(orjson.loads(f.read()))
-                        except Exception as e:
-                            traceback.print_exc()
-                            err_prompt.append(f"Failed to load {lang_file_path}: {e}")
+    for modules_locales_file in locales_path:
+        if Path(modules_locales_file).is_dir():
+            locales_m = [c.name for c in Path(modules_locales_file).iterdir()]
+            for lang_file in locales_m:
+                lang_file_path = Path(modules_locales_file) / lang_file
+                with open(lang_file_path, "rb") as f:
+                    try:
+                        if lang_file.removesuffix(".json") in locale_dict:
+                            locale_dict[lang_file.removesuffix(".json")].update(flatten(orjson.loads(f.read())))
+                        else:
+                            locale_dict[lang_file.removesuffix(".json")] = flatten(orjson.loads(f.read()))
+                    except Exception as e:
+                        traceback.print_exc()
+                        err_prompt.append(f"Failed to load {lang_file_path}: {e}")
 
     for lang in locale_dict:
         locale_root.update_node(f"{lang}", None)
