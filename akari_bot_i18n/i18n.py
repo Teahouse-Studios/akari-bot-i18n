@@ -204,6 +204,4 @@ class Locale:
         return text
 
 
-load_locale_file()
-
 __all__ = ["Locale", "load_locale_file", "get_available_locales"]
