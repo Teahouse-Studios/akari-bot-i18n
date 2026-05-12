@@ -164,7 +164,7 @@ class Locale:
     def get_string_with_fallback(
         self,
         key: str,
-        as_is: bool = False,
+        fallback: bool = True,
         locale_failed_prompt: bool = True,
     ) -> str:
         # 1. 当前语言
@@ -174,7 +174,7 @@ class Locale:
             return val
 
         # 2. fallback
-        if not as_is:
+        if fallback:
             for lng in self.fallback_lng:
                 fallback_dict = locale_data.get(lng, {})
 
@@ -192,39 +192,39 @@ class Locale:
                 f"{{I18N:{key}}}"
                 + self.t(
                     "error.i18n.fallback",
-                    as_is=as_is,
+                    fallback=fallback,
                     locale_failed_prompt=False,
                 )
             )
 
         return f"{{I18N:{key}}}"
 
-    def t(self, key: str | dict, as_is: bool = False, locale_failed_prompt: bool = True, **kwargs: Any) -> str:
+    def t(self, key: str | dict, fallback: bool = True, locale_failed_prompt: bool = True, **kwargs: Any) -> str:
         """
         获取本地化字符串。
 
         :param key: 本地化键名。
-        :param as_is: 是否禁用 fallback。
-        :param locale_failed_prompt: 是否添加本地化失败提示。（默认为True）
+        :param fallback: 是否使用 fallback。（默认为 True）
+        :param locale_failed_prompt: 是否添加本地化失败提示。（默认为 True）
         :returns: 本地化字符串。
         """
         with _locale_lock:
             if isinstance(key, dict):
                 if ft := key.get(self.locale):
                     return str(ft)
-                if not as_is and "fallback" in key:
-                    return str(key["fallback"])
-                return str(key) + self.t("error.i18n.fallback", locale_failed_prompt=False, fallback=self.locale)
+                if fallback and "_fallback_locale" in key:
+                    return str(key["_fallback_locale"])
+                return str(key) + self.t("error.i18n.fallback", locale_failed_prompt=False, _fallback_locale=self.locale)
 
-            localized = self.get_string_with_fallback(key, as_is, locale_failed_prompt)
+            localized = self.get_string_with_fallback(key, fallback, locale_failed_prompt)
             return Template(localized).safe_substitute(**kwargs)
 
-    def t_str(self, text: str, as_is: bool = False, locale_failed_prompt: bool = False, **kwargs: dict[str, Any]) -> str:
+    def t_str(self, text: str, fallback: bool = True, locale_failed_prompt: bool = False, **kwargs: dict[str, Any]) -> str:
         """
         替换字符串中的本地化键名。
 
         :param text: 字符串。
-        :param as_is: 是否禁用 fallback。
+        :param fallback: 是否使用 fallback。（默认为 True）
         :param locale_failed_prompt: 是否添加本地化失败提示。（默认为False）
         :returns: 本地化后的字符串。
         """
@@ -237,7 +237,7 @@ class Locale:
                 if params_str:
                     params_str = self.t_str(
                         params_str,
-                        as_is=as_is,
+                        fallback=fallback,
                         locale_failed_prompt=locale_failed_prompt,
                     )
                     param_pairs = re.findall(r"(\w+)=([^,]+)", params_str)
@@ -246,7 +246,7 @@ class Locale:
                 all_kwargs = {**kwargs, **local_kwargs}
                 t_value = self.t(
                     key,
-                    as_is=as_is,
+                    fallback=fallback,
                     locale_failed_prompt=locale_failed_prompt,
                     **all_kwargs
                 )
