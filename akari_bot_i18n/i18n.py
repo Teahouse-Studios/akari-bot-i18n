@@ -3,200 +3,262 @@ import re
 import traceback
 from pathlib import Path
 from string import Template
-from typing import Any, Optional
+from threading import RLock
+from typing import Any
 
 import orjson
 
 from .utils import flatten_dict as flatten
-
 
 # Load all locale files into memory
 
 # We might change this behavior in the future and read them on demand as
 # locale files get too large
 
-supported_locales = []
+MAX_I18NCODE_DEPTH = 10
+
+# 全局状态管理
+supported_locales: list[str] = []
+_lang_list: list[str] = []
+_locales_path: list[str] = []
+_locale_lock = RLock()
+locale_data: dict[str, dict[str, str]] = {}
 
 
-class LocaleNode:
-    """本地化树节点"""
+def load_locale_file(
+    lang_list: list[str],
+    locales_path: list[str] | None = None,
+    reload: bool = False,
+) -> list[str]:
+    with _locale_lock:
+        for lang in lang_list:
+            if lang not in supported_locales:
+                supported_locales.append(lang)
 
-    value: str
-    children: dict
+        if not reload:
+            for lang in lang_list:
+                if lang not in _lang_list:
+                    _lang_list.append(lang)
 
-    def __init__(self, v: str = None):
-        self.value = v
-        self.children = {}
+            if locales_path:
+                for p in locales_path:
+                    if p not in _locales_path:
+                        _locales_path.append(p)
 
-    def query_node(self, path: str):
-        """查询本地化树节点"""
-        return self._query_node(path.split("."))
+        err_prompt: list[str] = []
 
-    def _query_node(self, path: list[str]):
-        """通过路径队列查询本地化树节点"""
-        if len(path) == 0:
-            return self
-        nxt_node = path[0]
-        if nxt_node in self.children:
-            return self.children[nxt_node]._query_node(path[1:])
-        return None
+        # 用于记录 key 来源
+        key_source_map: dict[str, dict[str, list[str]]] = {}
 
-    def update_node(self, path: str, write_value: str):
-        """更新本地化树节点"""
-        return self._update_node(path.split("."), write_value)
+        # staging 区
+        new_locale_data: dict[str, dict[str, str]] = {}
 
-    def _update_node(self, path: list[str], write_value: str):
-        """通过路径队列更新本地化树节点"""
-        if len(path) == 0:
-            self.value = write_value
-            return
-        nxt_node = path[0]
-        if nxt_node not in self.children:
-            self.children[nxt_node] = LocaleNode()
-        self.children[nxt_node]._update_node(path[1:], write_value)
-
-
-locale_root = LocaleNode()
-_lang_list = []
-_locales_path = []
-
-
-def load_locale_file(lang_list: list[str], locales_path: Optional[list[str]]=None, reload=False) -> list[str]:
-    supported_locales.extend(lang_list)
-    if not reload:
-        _lang_list.extend(lang_list)
         if locales_path:
-            _locales_path.extend(locales_path)
-    locale_dict = {}
-    err_prompt = []
+            for modules_locales_file in locales_path:
+                dir_path = Path(modules_locales_file)
 
-    for modules_locales_file in locales_path:
-        if Path(modules_locales_file).is_dir():
-            locales_m = [c.name for c in Path(modules_locales_file).iterdir()]
-            for lang_file in locales_m:
-                lang_file_path = Path(modules_locales_file) / lang_file
-                with open(lang_file_path, "rb") as f:
+                if not dir_path.is_dir():
+                    continue
+
+                for lang_file_path in dir_path.iterdir():
+                    if (
+                        not lang_file_path.is_file()
+                        or not lang_file_path.name.endswith(".json")
+                    ):
+                        continue
+
+                    lang_key = lang_file_path.stem
+
                     try:
-                        if lang_file.removesuffix(".json") in locale_dict:
-                            locale_dict[lang_file.removesuffix(".json")].update(flatten(orjson.loads(f.read())))
-                        else:
-                            locale_dict[lang_file.removesuffix(".json")] = flatten(orjson.loads(f.read()))
+                        with open(lang_file_path, "rb") as f:
+                            raw_data = orjson.loads(f.read())
+
+                        flat_data = {
+                            k: str(v)
+                            for k, v in flatten(raw_data).items()
+                            if v is not None
+                        }
+
+                        if lang_key not in new_locale_data:
+                            new_locale_data[lang_key] = {}
+
+                        if lang_key not in key_source_map:
+                            key_source_map[lang_key] = {}
+
+                        for k, v in flat_data.items():
+
+                            # 记录 key 来源
+                            if k not in key_source_map[lang_key]:
+                                key_source_map[lang_key][k] = []
+
+                            key_source_map[lang_key][k].append(
+                                str(lang_file_path)
+                            )
+
+                            # 写入 staging 数据
+                            new_locale_data[lang_key][k] = v
+
                     except Exception as e:
                         traceback.print_exc()
-                        err_prompt.append(f"Failed to load {lang_file_path}: {e}")
+                        err_prompt.append(
+                            f"Failed to load {lang_file_path}: {e}"
+                        )
 
-    for lang in locale_dict:
-        locale_root.update_node(f"{lang}", None)
+        # 冲突检测
+        for lang_key, keys in key_source_map.items():
+            conflicted_keys = [
+                k
+                for k, sources in keys.items()
+                if len(sources) > 1
+            ]
 
-        for k in locale_dict[lang].keys():
-            locale_root.update_node(f"{lang}.{k}", locale_dict[lang][k])
+            for k in conflicted_keys:
+                sources = keys[k]
 
-    return err_prompt
+                # 删除冲突 key
+                if (
+                    lang_key in new_locale_data
+                    and k in new_locale_data[lang_key]
+                ):
+                    del new_locale_data[lang_key][k]
 
+                err_prompt.append(
+                    f'Conflict detected for key "{k}":'
+                )
+
+                err_prompt.extend(sources)
+
+        # 原子替换
+        locale_data.clear()
+        locale_data.update(new_locale_data)
+
+        return err_prompt
 
 def get_available_locales() -> list[str]:
-    return list(locale_root.children.keys())
+    return list(locale_data.keys())
 
 
 class Locale:
     """
     创建一个本地化对象。
     """
-
     def __init__(self, locale: str, fallback_lng: list[str] | None = None):
-        if not fallback_lng:
-            fallback_lng = supported_locales.copy()
-            fallback_lng.remove(locale)
         self.locale = locale
-        self.data: LocaleNode = locale_root.query_node(locale) or LocaleNode()
+        if fallback_lng is None:
+            fallback_lng = [l for l in supported_locales if l != locale]
         self.fallback_lng = fallback_lng
 
-    def __getitem__(self, key: str):
-        return self.data.query_node(key)
+    @property
+    def data(self) -> dict[str, str]:
+        return locale_data.get(self.locale, {})
 
-    def __contains__(self, key: str):
+    def __getitem__(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    def __contains__(self, key: str) -> bool:
         return key in self.data
 
-    def reload(self):
-        error = load_locale_file(_lang_list, _locales_path, reload=True)
-        if not error:
-            self.data = locale_root.query_node(self.locale)
-        return error
+    def reload(self) -> list[str]:
+        return load_locale_file(_lang_list, _locales_path, reload=True)
 
-    def get_locale_node(self, path: str):
-        """获取本地化节点。"""
-        return self.data.query_node(path)
+    def get_string_with_fallback(
+        self,
+        key: str,
+        as_is: bool = False,
+        locale_failed_prompt: bool = True,
+    ) -> str:
+        # 1. 当前语言
+        val = self.data.get(key)
 
-    def get_string_with_fallback(self, key: str, fallback_failed_prompt: bool = True) -> str:
-        node = self.data.query_node(key)
-        if node:
-            return node.value
-            # 1. 如果本地化字符串存在，直接返回
-        fallback_lng = list(self.fallback_lng)
-        fallback_lng.insert(0, self.locale)
-        for lng in fallback_lng:
-            if lng in locale_root.children:
-                node = locale_root.query_node(lng).query_node(key)
-                if node:
-                    return node.value
-                    # 2. 如果在 fallback 语言中本地化字符串存在，直接返回
-        if fallback_failed_prompt:
-            return f"{{I18N:{key}}}" + self.t("error.i18n.fallback", fallback_failed_prompt=False)
+        if val is not None:
+            return val
+
+        # 2. fallback
+        if not as_is:
+            for lng in self.fallback_lng:
+                fallback_dict = locale_data.get(lng, {})
+
+                val = fallback_dict.get(key)
+
+                if val is not None:
+                    return val
+
+        # 3. fallback failed
+        if locale_failed_prompt:
+            if key == "error.i18n.fallback":
+                return f"{{I18N:{key}}}"
+
+            return (
+                f"{{I18N:{key}}}"
+                + self.t(
+                    "error.i18n.fallback",
+                    as_is=as_is,
+                    locale_failed_prompt=False,
+                )
+            )
+
         return f"{{I18N:{key}}}"
-        # 3. 如果在 fallback 语言中本地化字符串不存在，返回 key
 
-    def t(self, key: str | dict, fallback_failed_prompt: bool = True, **kwargs: Any) -> str:
+    def t(self, key: str | dict, as_is: bool = False, locale_failed_prompt: bool = True, **kwargs: Any) -> str:
         """
         获取本地化字符串。
 
         :param key: 本地化键名。
-        :param fallback_failed_prompt: 是否添加本地化失败提示。（默认为True）
+        :param as_is: 是否禁用 fallback。
+        :param locale_failed_prompt: 是否添加本地化失败提示。（默认为True）
         :returns: 本地化字符串。
         """
-        if isinstance(key, dict):
-            if ft := key.get(self.locale):
-                return ft
-            if "fallback" in key:
-                return key["fallback"]
-            return str(key) + self.t("error.i18n.fallback", fallback=self.locale)
-        localized = self.get_string_with_fallback(key, fallback_failed_prompt)
-        return Template(localized).safe_substitute(**kwargs)
+        with _locale_lock:
+            if isinstance(key, dict):
+                if ft := key.get(self.locale):
+                    return str(ft)
+                if not as_is and "fallback" in key:
+                    return str(key["fallback"])
+                return str(key) + self.t("error.i18n.fallback", locale_failed_prompt=False, fallback=self.locale)
 
-    def t_str(self, text: str, fallback_failed_prompt: bool = False, **kwargs: dict[str, Any]) -> str:
+            localized = self.get_string_with_fallback(key, as_is, locale_failed_prompt)
+            return Template(localized).safe_substitute(**kwargs)
+
+    def t_str(self, text: str, as_is: bool = False, locale_failed_prompt: bool = False, **kwargs: dict[str, Any]) -> str:
         """
         替换字符串中的本地化键名。
 
         :param text: 字符串。
-        :param fallback_failed_prompt: 是否添加本地化失败提示。（默认为False）
+        :param as_is: 是否禁用 fallback。
+        :param locale_failed_prompt: 是否添加本地化失败提示。（默认为False）
         :returns: 本地化后的字符串。
         """
+        with _locale_lock:
+            def match_i18ncode(match):
+                full = match.group(0)
+                key = html.unescape(match.group(1))
+                params_str = match.group(2)
+                local_kwargs = {}
+                if params_str:
+                    params_str = self.t_str(
+                        params_str,
+                        as_is=as_is,
+                        locale_failed_prompt=locale_failed_prompt,
+                    )
+                    param_pairs = re.findall(r"(\w+)=([^,]+)", params_str)
+                    for k, v in param_pairs:
+                        local_kwargs[html.unescape(k)] = html.unescape(v)
+                all_kwargs = {**kwargs, **local_kwargs}
+                t_value = self.t(
+                    key,
+                    as_is=as_is,
+                    locale_failed_prompt=locale_failed_prompt,
+                    **all_kwargs
+                )
+                return t_value if isinstance(t_value, str) else full
 
-        def match_i18ncode(match):
-            full = match.group(0)
-            key = html.unescape(match.group(1))
-            params_str = match.group(2)
-
-            local_kwargs = {}
-
-            if params_str:
-                params_str = self.t_str(params_str, fallback_failed_prompt=fallback_failed_prompt)
-
-                param_pairs = re.findall(r"(\w+)=([^,]+)", params_str)
-                for k, v in param_pairs:
-                    local_kwargs[html.unescape(k)] = html.unescape(v)
-
-            all_kwargs = {**kwargs, **local_kwargs}
-
-            t_value = self.t(key, fallback_failed_prompt=fallback_failed_prompt, **all_kwargs)
-
-            return t_value if isinstance(t_value, str) else full
-
-        prev_text = None
-        while prev_text != text:
-            prev_text = text
-            text = re.sub(r"\{I18N:([^\s,{}]+)(?:,([^\{\}]*))?\}", match_i18ncode, text)
-
-        return text
+            prev_text = None
+            depth = 0
+            while prev_text != text and depth < MAX_I18NCODE_DEPTH:
+                prev_text = text
+                text = re.sub(r"\{I18N:([^\s,{}]+)(?:,([^\{\}]*))?\}", match_i18ncode, text)
+                depth += 1
+            return text
 
 
 __all__ = ["Locale", "load_locale_file", "get_available_locales"]
