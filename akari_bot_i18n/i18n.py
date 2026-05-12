@@ -158,7 +158,8 @@ class Locale:
     def __contains__(self, key: str) -> bool:
         return key in self.data
 
-    def reload(self) -> list[str]:
+    @staticmethod
+    def reload() -> list[str]:
         return load_locale_file(_lang_list, _locales_path, reload=True)
 
     def get_string_with_fallback(
