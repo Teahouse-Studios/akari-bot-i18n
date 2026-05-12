@@ -4,6 +4,4 @@
 __pycache__
 
 test*
-./dist
 *.log
-node_modules/*
