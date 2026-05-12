@@ -57,10 +57,16 @@ class LocaleNode:
 
 
 locale_root = LocaleNode()
+_lang_list = []
+_locales_path = []
 
 
-def load_locale_file(lang_list: list[str], locales_path: Optional[list[str]]=None) -> list[str]:
+def load_locale_file(lang_list: list[str], locales_path: Optional[list[str]]=None, reload=False) -> list[str]:
     supported_locales.extend(lang_list)
+    if not reload:
+        _lang_list.extend(lang_list)
+        if locales_path:
+            _locales_path.extend(locales_path)
     locale_dict = {}
     err_prompt = []
 
@@ -112,7 +118,7 @@ class Locale:
         return key in self.data
 
     def reload(self):
-        error = load_locale_file()
+        error = load_locale_file(_lang_list, _locales_path, reload=True)
         if not error:
             self.data = locale_root.query_node(self.locale)
         return error
