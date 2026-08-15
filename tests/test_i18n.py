@@ -26,8 +26,8 @@ def _load_in_worker(
 
 
 def _observe_reload_in_worker(
-    locales_path: str,
     cache_path: str,
+    namespace: str,
     command_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue,
 ) -> None:
@@ -35,12 +35,20 @@ def _observe_reload_in_worker(
     from akari_bot_i18n import i18n as worker_i18n
 
     worker_i18n.MANIFEST_CHECK_INTERVAL = 0.05
-    worker_i18n.load_locale_file(["en_us"], [locales_path])
+    worker_i18n.connect_locale_snapshot(namespace)
     locale = worker_i18n.Locale("en_us")
     result_queue.put(locale["version"])
     command_queue.get(timeout=20)
     time.sleep(0.1)
     result_queue.put(locale["version"])
+
+
+def _connect_in_worker(cache_path: str, namespace: str, result_queue: multiprocessing.Queue) -> None:
+    os.environ["AKARI_BOT_I18N_CACHE_DIR"] = cache_path
+    from akari_bot_i18n.i18n import Locale, connect_locale_snapshot
+
+    generation = connect_locale_snapshot(namespace)
+    result_queue.put((generation, Locale("en_us").t("greeting")))
 
 
 class LocaleSQLiteTests(unittest.TestCase):
@@ -194,20 +202,69 @@ class LocaleSQLiteTests(unittest.TestCase):
         self.assertEqual(len(manifests), 1)
         self.assertEqual(len(databases), 1)
 
+    def test_build_and_connect_are_separate(self) -> None:
+        namespace = "separate-reader-test"
+        self.write_locale(self.locales, "en_us", {"greeting": "Hello"})
+
+        errors = i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(i18n.get_available_locales(), [])
+        self.assertEqual(i18n.supported_locales, [])
+        (self.locales / "en_us.json").unlink()
+
+        generation = i18n.connect_locale_snapshot(namespace)
+
+        self.assertTrue(generation)
+        self.assertEqual(i18n.Locale("en_us")["greeting"], "Hello")
+        self.assertEqual(i18n.supported_locales, ["en_us"])
+
+        self.write_locale(self.locales, "en_us", {"greeting": "Updated"})
+        i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
+        i18n.Locale.reload()
+
+        self.assertEqual(i18n.Locale("en_us")["greeting"], "Updated")
+
+    def test_reader_processes_only_connect_to_named_snapshot(self) -> None:
+        namespace = "reader-process-test"
+        self.write_locale(self.locales, "en_us", {"greeting": "Hello"})
+        i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
+        context = multiprocessing.get_context("spawn")
+        result_queue = context.Queue()
+        processes = [
+            context.Process(
+                target=_connect_in_worker,
+                args=(str(self.cache), namespace, result_queue),
+            )
+            for _ in range(4)
+        ]
+
+        for process in processes:
+            process.start()
+        results = [result_queue.get(timeout=20) for _ in processes]
+        for process in processes:
+            process.join(timeout=20)
+
+        self.assertTrue(all(process.exitcode == 0 for process in processes))
+        self.assertTrue(all(generation for generation, _ in results))
+        self.assertEqual([translation for _, translation in results], ["Hello"] * len(processes))
+
     def test_reader_process_refreshes_after_another_process_reloads(self) -> None:
+        namespace = "reload-reader-test"
         self.write_locale(self.locales, "en_us", {"version": "old"})
+        i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
         context = multiprocessing.get_context("spawn")
         command_queue = context.Queue()
         result_queue = context.Queue()
         process = context.Process(
             target=_observe_reload_in_worker,
-            args=(str(self.locales), str(self.cache), command_queue, result_queue),
+            args=(str(self.cache), namespace, command_queue, result_queue),
         )
         process.start()
         self.assertEqual(result_queue.get(timeout=20), "old")
 
         self.write_locale(self.locales, "en_us", {"version": "new value"})
-        i18n.load_locale_file(["en_us"], [str(self.locales)])
+        i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
         command_queue.put("read")
 
         self.assertEqual(result_queue.get(timeout=20), "new value")

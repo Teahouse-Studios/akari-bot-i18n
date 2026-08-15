@@ -31,6 +31,7 @@ _locales_path: list[str] = []
 _locale_lock = RLock()
 _load_lock = RLock()
 _store: "_SQLiteLocaleStore | None" = None
+_connected_namespace: str | None = None
 
 
 class _InterProcessFileLock:
@@ -157,6 +158,7 @@ class _SQLiteLocaleStore:
         self._lock = RLock()
         self._connection: sqlite3.Connection | None = None
         self._generation = ""
+        self._supported_locales: tuple[str, ...] = ()
         self._pid = os.getpid()
         self._last_manifest_check = 0.0
         self._install_manifest(manifest)
@@ -187,6 +189,10 @@ class _SQLiteLocaleStore:
         old_connection = self._connection
         self._connection = connection
         self._generation = generation
+        declared_locales = manifest.get("supported_locales", [])
+        self._supported_locales = (
+            tuple(str(locale) for locale in declared_locales) if isinstance(declared_locales, list) else ()
+        )
         self._pid = os.getpid()
         if old_connection is not None:
             old_connection.close()
@@ -237,6 +243,11 @@ class _SQLiteLocaleStore:
                 return ()
             rows = self._connection.execute("SELECT locale FROM locales ORDER BY position").fetchall()
             return tuple(str(row[0]) for row in rows)
+
+    def supported_locales(self) -> tuple[str, ...]:
+        with self._lock:
+            self._refresh_if_needed()
+            return self._supported_locales or self.available_locales()
 
     def locale_keys(self, locale: str) -> tuple[str, ...]:
         with self._lock:
@@ -349,25 +360,37 @@ def _source_signature(
     return digest.hexdigest()
 
 
-def _snapshot_root(languages: tuple[str, ...], locales_paths: tuple[str, ...]) -> Path:
-    """为同一组语言和来源生成稳定目录，使不同 worker 能找到同一个 manifest。"""
-
+def _snapshot_cache_base() -> Path:
     configured_base = os.environ.get("AKARI_BOT_I18N_CACHE_DIR")
     if configured_base:
-        base = Path(configured_base)
-    else:
-        user_suffix = f"_{os.getuid()}" if hasattr(os, "getuid") else ""
-        base = Path(tempfile.gettempdir()) / f"akari_bot_i18n{user_suffix}"
+        return Path(configured_base)
+    user_suffix = f"_{os.getuid()}" if hasattr(os, "getuid") else ""
+    return Path(tempfile.gettempdir()) / f"akari_bot_i18n{user_suffix}"
+
+
+def _snapshot_root(languages: tuple[str, ...], locales_paths: tuple[str, ...]) -> Path:
+    """为旧版组合 API 生成稳定目录，使不同 worker 能找到同一个 manifest。"""
+
     identity = hashlib.sha256()
     for language in languages:
         identity.update(f"language:{language}\0".encode())
     for locales_path in locales_paths:
         identity.update(f"path:{Path(locales_path).resolve()}\0".encode())
-    return base / identity.hexdigest()[:24]
+    return _snapshot_cache_base() / identity.hexdigest()[:24]
+
+
+def _named_snapshot_root(namespace: str) -> Path:
+    """命名空间只参与哈希，不能被当作路径片段逃逸缓存根目录。"""
+
+    if not namespace:
+        raise ValueError("Locale snapshot namespace cannot be empty")
+    identity = hashlib.sha256(f"namespace:{namespace}".encode()).hexdigest()[:24]
+    return _snapshot_cache_base() / f"named-{identity}"
 
 
 def _build_snapshot(
     root: Path,
+    languages: tuple[str, ...],
     source_files: tuple[Path, ...],
     source_signature: str,
 ) -> tuple[Path, dict[str, Any]]:
@@ -490,6 +513,7 @@ def _build_snapshot(
             "db_name": db_name,
             "db_size": final_db.stat().st_size,
             "source_signature": source_signature,
+            "supported_locales": list(languages),
             "errors": errors,
             "has_load_failures": has_load_failures,
         }
@@ -574,7 +598,7 @@ def _ensure_snapshot(
                 errors = [str(error) for error in manifest_errors] if isinstance(manifest_errors, list) else []
                 return manifest, errors
 
-            final_db, new_manifest = _build_snapshot(root, source_files, signature_before)
+            final_db, new_manifest = _build_snapshot(root, languages, source_files, signature_before)
             try:
                 refreshed_files = _source_files(locales_paths)
                 signature_after = _source_signature(languages, locales_paths, refreshed_files)
@@ -609,12 +633,70 @@ def _get_value(locale: str, key: str) -> str | None:
         return _store.get(locale, key)
 
 
+def _activate_snapshot(root: Path, manifest: Mapping[str, Any], replace_supported: bool = False) -> str:
+    """先建立健康连接，再用一次短临界区替换当前进程的 store。"""
+
+    global _store
+
+    try:
+        new_store = _SQLiteLocaleStore(root, manifest)
+    except (OSError, RuntimeError, sqlite3.Error):
+        # manifest 可能在 ensure 返回后被另一个发布者更新；失败时重读 current 再尝试一次。
+        latest_manifest = _read_manifest(root / "current.json")
+        if latest_manifest is None or latest_manifest.get("generation") == manifest.get("generation"):
+            raise
+        new_store = _SQLiteLocaleStore(root, latest_manifest)
+
+    with _locale_lock:
+        if replace_supported:
+            supported_locales.clear()
+            supported_locales.extend(new_store.supported_locales())
+        old_store = _store
+        _store = new_store
+        if old_store is not None:
+            old_store.close()
+    return new_store.generation
+
+
+def build_locale_snapshot(
+    lang_list: list[str],
+    locales_path: list[str],
+    namespace: str,
+) -> list[str]:
+    """构建并发布命名快照，但不连接或修改当前进程的翻译状态。"""
+
+    languages = tuple(lang_list)
+    locales_paths = tuple(locales_path)
+    root = _named_snapshot_root(namespace)
+    with _load_lock:
+        _, errors = _ensure_snapshot(root, languages, locales_paths)
+    return errors
+
+
+def connect_locale_snapshot(namespace: str) -> str:
+    """只连接已发布的命名快照；reader 不需要访问 JSON 源目录。"""
+
+    global _connected_namespace
+
+    root = _named_snapshot_root(namespace)
+    with _load_lock:
+        # 若 builder 正在首次发布，等待其释放锁后再读取 manifest。
+        with _InterProcessFileLock(root / ".snapshot-publish.lock"):
+            manifest = _read_manifest(root / "current.json")
+        if manifest is None:
+            raise FileNotFoundError(f'Locale snapshot namespace "{namespace}" has not been built')
+        generation = _activate_snapshot(root, manifest, replace_supported=True)
+        with _locale_lock:
+            _connected_namespace = namespace
+        return generation
+
+
 def load_locale_file(
     lang_list: list[str],
     locales_path: list[str] | None = None,
     reload: bool = False,
 ) -> list[str]:
-    global _store
+    global _connected_namespace
 
     with _load_lock:
         with _locale_lock:
@@ -639,20 +721,10 @@ def load_locale_file(
         # 已注册来源决定共享 manifest 的位置；普通 load 仍只导入本次传入的路径。
         root = _snapshot_root(registered_languages, registered_paths)
         manifest, errors = _ensure_snapshot(root, languages, locales_paths)
-        try:
-            new_store = _SQLiteLocaleStore(root, manifest)
-        except (OSError, RuntimeError, sqlite3.Error):
-            latest_manifest = _read_manifest(root / "current.json")
-            if latest_manifest is None or latest_manifest.get("generation") == manifest.get("generation"):
-                raise
-            new_store = _SQLiteLocaleStore(root, latest_manifest)
-
+        # 构建在锁外完成，最后仅用一次指针/连接交换提交到当前进程。
+        _activate_snapshot(root, manifest)
         with _locale_lock:
-            # 构建在锁外完成，最后仅用一次指针/连接交换提交到当前进程。
-            old_store = _store
-            _store = new_store
-            if old_store is not None:
-                old_store.close()
+            _connected_namespace = None
 
         return errors
 
@@ -670,7 +742,9 @@ class Locale:
     def __init__(self, locale: str, fallback_lng: list[str] | None = None):
         self.locale = locale
         if fallback_lng is None:
-            fallback_lng = [language for language in supported_locales if language != locale]
+            with _locale_lock:
+                fallback_source = _store.supported_locales() if _store is not None else tuple(supported_locales)
+            fallback_lng = [language for language in fallback_source if language != locale]
         self.fallback_lng = fallback_lng
 
     @property
@@ -685,6 +759,14 @@ class Locale:
 
     @staticmethod
     def reload() -> list[str]:
+        with _locale_lock:
+            namespace = _connected_namespace
+        if namespace is not None:
+            # 分离模式下 reload 只强制重连最新 manifest，不允许 reader 回头读取 JSON。
+            connect_locale_snapshot(namespace)
+            manifest = _read_manifest(_named_snapshot_root(namespace) / "current.json")
+            manifest_errors = manifest.get("errors", []) if manifest is not None else []
+            return [str(error) for error in manifest_errors] if isinstance(manifest_errors, list) else []
         return load_locale_file(_lang_list, _locales_path, reload=True)
 
     def get_string_with_fallback(
@@ -789,14 +871,21 @@ class Locale:
 
 
 def _reset_state_for_testing() -> None:
-    global _store
+    global _connected_namespace, _store
     with _locale_lock:
         if _store is not None:
             _store.close()
         _store = None
+        _connected_namespace = None
         supported_locales.clear()
         _lang_list.clear()
         _locales_path.clear()
 
 
-__all__ = ["Locale", "load_locale_file", "get_available_locales"]
+__all__ = [
+    "Locale",
+    "build_locale_snapshot",
+    "connect_locale_snapshot",
+    "get_available_locales",
+    "load_locale_file",
+]
