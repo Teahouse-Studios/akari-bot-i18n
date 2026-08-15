@@ -249,6 +249,15 @@ class LocaleSQLiteTests(unittest.TestCase):
         self.assertTrue(all(generation for generation, _ in results))
         self.assertEqual([translation for _, translation in results], ["Hello"] * len(processes))
 
+    def test_build_keeps_only_current_and_previous_snapshots(self) -> None:
+        namespace = "snapshot-retention-test"
+        for version in range(6):
+            self.write_locale(self.locales, "en_us", {"version": f"value-{version}"})
+            i18n.build_locale_snapshot(["en_us"], [str(self.locales)], namespace)
+
+        databases = list(self.cache.rglob("locales.*.db"))
+        self.assertEqual(len(databases), 2)
+
     def test_reader_process_refreshes_after_another_process_reloads(self) -> None:
         namespace = "reload-reader-test"
         self.write_locale(self.locales, "en_us", {"version": "old"})

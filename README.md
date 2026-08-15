@@ -21,3 +21,5 @@ connect_locale_snapshot("akari-bot")
 ```
 
 命名空间连接会自动跟随 loader 后续发布的新 generation。reader 调用 `Locale.reload()` 时也只会强制重连 manifest，不会读取 JSON。原有 `load_locale_file()` 保留为“构建并连接”的兼容入口。
+
+每个 namespace 默认只保留当前和上一个 generation。更老的数据库会在 build 或 reader 完成版本切换时清理；Windows 上仍被其他进程打开的文件会在后续操作中重试删除。

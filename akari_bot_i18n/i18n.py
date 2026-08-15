@@ -21,8 +21,7 @@ MAX_I18NCODE_DEPTH = 10
 MANIFEST_CHECK_INTERVAL = 1.0
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_LOCK_TIMEOUT = 30.0
-OLD_SNAPSHOT_MIN_AGE = 24 * 60 * 60
-SNAPSHOTS_TO_KEEP = 3
+SNAPSHOTS_TO_KEEP = 2
 
 supported_locales: list[str] = []
 _lang_list: list[str] = []
@@ -158,6 +157,7 @@ class _SQLiteLocaleStore:
         self._lock = RLock()
         self._connection: sqlite3.Connection | None = None
         self._generation = ""
+        self._db_name = ""
         self._supported_locales: tuple[str, ...] = ()
         self._pid = os.getpid()
         self._last_manifest_check = 0.0
@@ -189,6 +189,7 @@ class _SQLiteLocaleStore:
         old_connection = self._connection
         self._connection = connection
         self._generation = generation
+        self._db_name = db_path.name
         declared_locales = manifest.get("supported_locales", [])
         self._supported_locales = (
             tuple(str(locale) for locale in declared_locales) if isinstance(declared_locales, list) else ()
@@ -196,6 +197,8 @@ class _SQLiteLocaleStore:
         self._pid = os.getpid()
         if old_connection is not None:
             old_connection.close()
+        # reader 关闭旧连接后再补一次清理，尤其用于 Windows 上此前被占用的数据库。
+        _cleanup_old_snapshots(self.root, self._db_name)
 
     def _refresh_if_needed(self, force: bool = False) -> None:
         current_pid = os.getpid()
@@ -552,18 +555,24 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _cleanup_old_snapshots(root: Path, current_db_name: str) -> None:
-    cutoff = time.time() - OLD_SNAPSHOT_MIN_AGE
-    candidates = sorted(root.glob("locales.*.db"), key=lambda path: path.stat().st_mtime, reverse=True)
-    # 保留最近几个版本，覆盖 reader 已读旧 manifest、但尚未打开数据库的短暂窗口。
+    candidates_with_mtime: list[tuple[float, Path]] = []
+    for candidate in root.glob("locales.*.db"):
+        try:
+            candidates_with_mtime.append((candidate.stat().st_mtime, candidate))
+        except (FileNotFoundError, OSError):
+            continue
+    candidates = [candidate for _, candidate in sorted(candidates_with_mtime, key=lambda item: item[0], reverse=True)]
+
+    # 保留 current 和一个回退版本；更老的文件在每次 build/reader 切换时立即回收。
     protected_names = {candidate.name for candidate in candidates[:SNAPSHOTS_TO_KEEP]}
     protected_names.add(current_db_name)
     for candidate in candidates:
         if candidate.name in protected_names:
             continue
         try:
-            if candidate.stat().st_mtime < cutoff:
-                candidate.unlink()
+            candidate.unlink()
         except (FileNotFoundError, PermissionError, OSError):
+            # Windows 会拒绝删除其他进程仍打开的数据库，后续 refresh/build 会再次尝试。
             continue
 
 
