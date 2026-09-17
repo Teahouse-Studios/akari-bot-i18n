@@ -4,6 +4,7 @@ import tempfile
 import time
 import unittest
 from contextlib import redirect_stderr
+from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
 
@@ -279,6 +280,103 @@ class LocaleSQLiteTests(unittest.TestCase):
         self.assertEqual(result_queue.get(timeout=20), "new value")
         process.join(timeout=20)
         self.assertEqual(process.exitcode, 0)
+
+
+class SafeStrftimeTests(unittest.TestCase):
+    # 固定时间，避免断言依赖当前时间
+    fixed = datetime(2026, 9, 17, 20, 30, 45)
+
+    def setUp(self) -> None:
+        i18n._reset_state_for_testing()
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.locales = self.root / "locales"
+        self.locales.mkdir()
+        self.cache = self.root / "cache"
+        self.previous_cache = os.environ.get("AKARI_BOT_I18N_CACHE_DIR")
+        os.environ["AKARI_BOT_I18N_CACHE_DIR"] = str(self.cache)
+
+    def tearDown(self) -> None:
+        i18n._reset_state_for_testing()
+        if self.previous_cache is None:
+            os.environ.pop("AKARI_BOT_I18N_CACHE_DIR", None)
+        else:
+            os.environ["AKARI_BOT_I18N_CACHE_DIR"] = self.previous_cache
+        self.temporary_directory.cleanup()
+
+    def write_locale(self, directory: Path, locale: str, data: dict) -> None:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / f"{locale}.json").write_bytes(orjson.dumps(data))
+
+    def test_ascii_format_matches_native_strftime(self) -> None:
+        fmt = "%Y-%m-%d %H:%M:%S"
+
+        self.assertEqual(i18n.safe_strftime(self.fixed, fmt), self.fixed.strftime(fmt))
+
+    def test_non_ascii_format_is_formatted_without_encoding_error(self) -> None:
+        # Windows 上原生 strftime 会因 ANSI 代码页无法编码韩文而抛出 UnicodeEncodeError
+        self.assertEqual(i18n.safe_strftime(self.fixed, "%Y년 %m월 %d일 %H:%M:%S"), "2026년 09월 17일 20:30:45")
+
+    def test_literal_percent_survives_non_ascii_format(self) -> None:
+        self.assertEqual(i18n.safe_strftime(self.fixed, "100%% 완료"), "100% 완료")
+        # 末尾孤立的 '%' 按字面文本处理，比部分平台的原生行为更宽松
+        self.assertEqual(i18n.safe_strftime(self.fixed, "%Y년 %m월 %d일 100%"), "2026년 09월 17일 100%")
+
+    def test_format_without_directives_is_kept_verbatim(self) -> None:
+        self.assertEqual(i18n.safe_strftime(self.fixed, "시간 없음"), "시간 없음")
+        self.assertEqual(i18n.safe_strftime(self.fixed, ""), "")
+
+    def test_date_object_is_supported(self) -> None:
+        self.assertEqual(i18n.safe_strftime(date(2026, 9, 17), "%Y년 %m월 %d일"), "2026년 09월 17일")
+
+    def test_format_with_adjacent_directives(self) -> None:
+        self.assertEqual(i18n.safe_strftime(self.fixed, "%Y년%m"), "2026년09")
+
+    def test_directive_modifiers_are_left_to_the_platform_strftime(self) -> None:
+        self.assertEqual(
+            i18n._split_strftime_format("%5Y년%-d"),
+            [(True, "%5Y"), (False, "년"), (True, "%-d")],
+        )
+        try:
+            expected = self.fixed.strftime("%5Y")
+        except ValueError:
+            # Windows 不支持字段宽度等修饰符，safe_strftime 同样会把 ValueError 抛出
+            with self.assertRaises(ValueError):
+                i18n.safe_strftime(self.fixed, "%5Y년")
+        else:
+            self.assertEqual(i18n.safe_strftime(self.fixed, "%5Y년"), f"{expected}년")
+
+    def test_locale_strftime_uses_localized_format(self) -> None:
+        self.write_locale(self.locales, "en_us", {"time.date.format": "%B %d, %Y"})
+        self.write_locale(self.locales, "ko_kr", {"time.date.format": "%Y년 %m월 %d일"})
+
+        errors = i18n.load_locale_file(["en_us", "ko_kr"], [str(self.locales)])
+
+        self.assertEqual(errors, [])
+        self.assertEqual(i18n.Locale("ko_kr").strftime(self.fixed, "time.date.format"), "2026년 09월 17일")
+        self.assertEqual(
+            i18n.Locale("en_us").strftime(self.fixed, "time.date.format"),
+            self.fixed.strftime("%B %d, %Y"),
+        )
+
+    def test_locale_strftime_falls_back_to_another_locale_format(self) -> None:
+        self.write_locale(self.locales, "en_us", {"time.date.format": "%B %d, %Y"})
+        self.write_locale(self.locales, "ko_kr", {"greeting": "안녕"})
+        i18n.load_locale_file(["en_us", "ko_kr"], [str(self.locales)])
+
+        self.assertEqual(
+            i18n.Locale("ko_kr").strftime(self.fixed, "time.date.format"),
+            self.fixed.strftime("%B %d, %Y"),
+        )
+
+    def test_locale_strftime_substitutes_parameters(self) -> None:
+        self.write_locale(self.locales, "en_us", {"time.date.format": "%Y년 $suffix"})
+        i18n.load_locale_file(["en_us"], [str(self.locales)])
+
+        self.assertEqual(
+            i18n.Locale("en_us").strftime(self.fixed, "time.date.format", suffix="완료"),
+            "2026년 완료",
+        )
 
 
 if __name__ == "__main__":

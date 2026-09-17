@@ -745,6 +745,58 @@ def get_available_locales() -> list[str]:
         return list(_store.available_locales())
 
 
+def _split_strftime_format(fmt: str) -> list[tuple[bool, str]]:
+    """
+    将 strftime 格式串拆分为 (是否为指令, 文本) 序列。
+
+    :param fmt: strftime 格式串。
+    :returns: 拆分后的序列。
+    """
+    tokens: list[tuple[bool, str]] = []
+    literal: list[str] = []
+    index = 0
+    length = len(fmt)
+    while index < length:
+        # 末尾孤立的 '%' 在部分平台上会直接报错，因此按字面文本处理
+        if fmt[index] != "%" or index + 1 == length:
+            literal.append(fmt[index])
+            index += 1
+            continue
+        end = index + 1
+        # 跳过标志位与字段宽度
+        while end < length and (fmt[end] in "-_0^#" or fmt[end] in "0123456789"):
+            end += 1
+        if end == length:
+            literal.append(fmt[index:])
+            break
+        if literal:
+            tokens.append((False, "".join(literal)))
+            literal.clear()
+        tokens.append((True, fmt[index : end + 1]))
+        index = end + 1
+    if literal:
+        tokens.append((False, "".join(literal)))
+    return tokens
+
+
+def safe_strftime(dt: Any, fmt: str) -> str:
+    """
+    使用可能包含非 ASCII 字符的格式串格式化时间对象。
+
+    Windows 上 datetime.strftime() 会先把整个格式串按进程 ANSI 代码页编码，
+    因此 `%Y년 %m월 %d일` 这类格式串会抛出 UnicodeEncodeError（启用 UTF-8 模式也无法避免）。
+    本函数只把 ASCII 的 strftime 指令交给 strftime()，其余字面文本原样保留，
+    从而在所有平台上得到相同结果。字段宽度等修饰符的支持情况仍与平台一致。
+
+    :param dt: 具有 strftime() 的日期或时间对象。
+    :param fmt: strftime 格式串，允许包含非 ASCII 字面文本。
+    :returns: 格式化后的字符串。
+    """
+    if fmt.isascii():
+        return dt.strftime(fmt)
+    return "".join(dt.strftime(token) if is_directive else token for is_directive, token in _split_strftime_format(fmt))
+
+
 class Locale:
     """创建一个本地化对象。"""
 
@@ -878,6 +930,28 @@ class Locale:
                 depth += 1
             return text
 
+    def strftime(
+        self,
+        dt: Any,
+        key: str,
+        fallback: bool = True,
+        locale_failed_prompt: bool = True,
+        **kwargs: Any,
+    ) -> str:
+        """
+        使用本地化格式串格式化时间对象。
+
+        :param dt: 具有 strftime() 的日期或时间对象。
+        :param key: 本地化键名，其值为 strftime 格式串。
+        :param fallback: 是否使用 fallback。（默认为 True）
+        :param locale_failed_prompt: 是否添加本地化失败提示。（默认为 True）
+        :returns: 格式化后的字符串。
+        """
+        return safe_strftime(
+            dt,
+            self.t(key, fallback=fallback, locale_failed_prompt=locale_failed_prompt, **kwargs),
+        )
+
 
 def _reset_state_for_testing() -> None:
     global _connected_namespace, _store
@@ -897,4 +971,5 @@ __all__ = [
     "connect_locale_snapshot",
     "get_available_locales",
     "load_locale_file",
+    "safe_strftime",
 ]
