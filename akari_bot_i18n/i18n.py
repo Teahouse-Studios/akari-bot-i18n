@@ -7,11 +7,11 @@ import tempfile
 import time
 import traceback
 import uuid
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from string import Template
 from threading import RLock
-from typing import Any
+from typing import Any, Protocol
 
 import orjson
 
@@ -22,6 +22,27 @@ MANIFEST_CHECK_INTERVAL = 1.0
 SNAPSHOT_SCHEMA_VERSION = 1
 SNAPSHOT_LOCK_TIMEOUT = 30.0
 SNAPSHOTS_TO_KEEP = 2
+
+# 术语占位符：{TERM:<name>} 或 {TERM:<name>,<param>=<value>,...}。
+# 标签必须大写（与 {I18N:...} 风格一致），名称必须小写；双写 {{...}} 不是合法占位符，也不会被解析。
+# 参数值允许包含 = : / ? 与空格，但不允许逗号或大括号，因此无需转义即可表达 URL。
+TERM_PLACEHOLDER_PREFIX = "{TERM:"
+TERM_PATTERN = re.compile(r"(?<!\{)\{TERM:([a-z][a-z0-9_]*)((?:,[A-Za-z_][A-Za-z0-9_]*=[^,{}]*)*)\}")
+TERM_PARAM_PATTERN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^,]*)")
+# 审计用：参数值额外允许 `${...}` 字面量。文案里的 `{TERM:target,count=${count}}` 会在 kwargs 插值
+# 之后变成 `{TERM:target,count=3}`，但静态扫描看到的是未插值形态，不应被误报为语法错误。
+TERM_PLAUSIBLE_PATTERN = re.compile(
+    r"(?<!\{)\{TERM:([a-z][a-z0-9_]*)((?:,[A-Za-z_][A-Za-z0-9_]*=(?:[^,{}$]|\$(?!\{)|\$\{[^{}]*\})*)*)\}"
+)
+# 形如术语占位符的片段（大小写不敏感），用于构建期审计；合法的占位符会被排除。
+TERM_LIKE_PATTERN = re.compile(r"\{[Tt][Ee][Rr][Mm]:(?:[^{}$]|\$(?!\{)|\$\{[^{}]*\})*\}?")
+# term.<name> 或 term.<name>.<candidate>（candidate 本身可以再含点）。
+TERM_KEY_PATTERN = re.compile(r"term\.([a-z][a-z0-9_]*)(?:\.(.+))?")
+I18NCODE_PATTERN = re.compile(r"\{I18N:([^\s,{}]+)(?:,([^{}]*))?\}")
+# 术语审计条目统一前缀，便于调用方在 errors 列表里识别，并让 audit_terms=False 在复用缓存时依然生效。
+TERM_AUDIT_PREFIX = "[term] "
+# 派生候选链时 token 不允许出现的字符：它们会破坏键名或占位符语法。
+_INVALID_TERM_TOKEN_CHARS = frozenset(".{}:")
 
 supported_locales: list[str] = []
 _lang_list: list[str] = []
@@ -396,6 +417,7 @@ def _build_snapshot(
     languages: tuple[str, ...],
     source_files: tuple[Path, ...],
     source_signature: str,
+    audit_terms: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
     generation = uuid.uuid4().hex
     db_name = f"locales.{generation}.db"
@@ -496,6 +518,20 @@ def _build_snapshot(
             DROP TABLE raw_translations;
             """
         )
+        # 术语校验在快照发布前运行，直接读取构建连接，结果并入 errors（报告但不阻断发布）。
+        if audit_terms:
+            try:
+                errors.extend(
+                    _audit_terms_with(
+                        _ConnectionLocaleReader(connection),
+                        locales=None,
+                        base_locale=languages[0] if languages else None,
+                        include_unreferenced=False,
+                    )
+                )
+            except Exception as error:
+                # 审计只是诊断，任何自身故障都不允许阻断快照发布。
+                errors.append(f"{TERM_AUDIT_PREFIX}term audit failed: {error}")
         connection.execute(f"PRAGMA user_version = {SNAPSHOT_SCHEMA_VERSION}")
         connection.commit()
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
@@ -580,6 +616,7 @@ def _ensure_snapshot(
     root: Path,
     languages: tuple[str, ...],
     locales_paths: tuple[str, ...],
+    audit_terms: bool = True,
 ) -> tuple[dict[str, Any], list[str]]:
     root.mkdir(parents=True, exist_ok=True)
     if os.name != "nt":
@@ -605,9 +642,15 @@ def _ensure_snapshot(
                 # 源内容未变化时直接复用当前 generation，避免重复解析 JSON。
                 manifest_errors = manifest.get("errors", [])
                 errors = [str(error) for error in manifest_errors] if isinstance(manifest_errors, list) else []
-                return manifest, errors
+                return manifest, _filter_term_audit_errors(errors, audit_terms)
 
-            final_db, new_manifest = _build_snapshot(root, languages, source_files, signature_before)
+            final_db, new_manifest = _build_snapshot(
+                root,
+                languages,
+                source_files,
+                signature_before,
+                audit_terms=audit_terms,
+            )
             try:
                 refreshed_files = _source_files(locales_paths)
                 signature_after = _source_signature(languages, locales_paths, refreshed_files)
@@ -642,6 +685,174 @@ def _get_value(locale: str, key: str) -> str | None:
         return _store.get(locale, key)
 
 
+class _LocaleReader(Protocol):
+    """术语审计需要的只读词条访问器。"""
+
+    def get(self, locale: str, key: str) -> str | None: ...
+
+    def keys(self, locale: str) -> tuple[str, ...]: ...
+
+    def locales(self) -> tuple[str, ...]: ...
+
+
+class _GlobalLocaleReader:
+    """把当前进程已连接的快照适配成审计所需的只读访问器。"""
+
+    def get(self, locale: str, key: str) -> str | None:
+        return _get_value(locale, key)
+
+    def keys(self, locale: str) -> tuple[str, ...]:
+        with _locale_lock:
+            if _store is None:
+                return ()
+            return _store.locale_keys(locale)
+
+    def locales(self) -> tuple[str, ...]:
+        with _locale_lock:
+            if _store is None:
+                return ()
+            return _store.available_locales()
+
+
+class _ConnectionLocaleReader:
+    """直接读取尚未激活的构建连接，使审计看到与最终快照完全一致的数据。"""
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+
+    def get(self, locale: str, key: str) -> str | None:
+        row = self._connection.execute(
+            "SELECT value FROM translations WHERE locale = ? AND key = ?",
+            (locale, key),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def keys(self, locale: str) -> tuple[str, ...]:
+        rows = self._connection.execute(
+            "SELECT key FROM translations WHERE locale = ? ORDER BY position",
+            (locale,),
+        ).fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+    def locales(self) -> tuple[str, ...]:
+        rows = self._connection.execute("SELECT locale FROM locales ORDER BY position").fetchall()
+        return tuple(str(row[0]) for row in rows)
+
+
+def _term_references(value: str) -> list[str]:
+    """取出值里所有术语占位符引用的术语名。"""
+
+    return [match.group(1) for match in TERM_PLAUSIBLE_PATTERN.finditer(value)]
+
+
+def _malformed_term_fragments(value: str) -> list[str]:
+    """取出值里形如术语占位符但不合法的片段（含未闭合形式）。"""
+
+    return [
+        match.group(0)
+        for match in TERM_LIKE_PATTERN.finditer(value)
+        if TERM_PLAUSIBLE_PATTERN.fullmatch(match.group(0)) is None
+    ]
+
+
+def _audit_terms_with(
+    reader: _LocaleReader,
+    locales: Sequence[str] | None,
+    base_locale: str | None,
+    include_unreferenced: bool,
+) -> list[str]:
+    """对给定访问器做静态术语校验；返回人类可读的问题清单（无问题返回空列表）。"""
+
+    available = reader.locales()
+    targets = list(available) if locales is None else [locale for locale in locales if locale in available]
+    if base_locale is None or base_locale not in available:
+        base_locale = targets[0] if targets else None
+    reporting = set(targets)
+
+    issues: list[str] = []
+    referenced: set[str] = set()
+
+    # 引用始终从全部已加载语言收集，这样按语言过滤审计时不会把别处的引用误判为“从未被引用”；
+    # 问题本身只为请求检查的语言报告。
+    for locale in available:
+        report = locale in reporting
+        for key in reader.keys(locale):
+            value = reader.get(locale, key)
+            if value is None:
+                continue
+
+            # 2. 占位符写法可疑（合法的 {TERM:...} 会被排除，双写 {{...}} 与无关文本不受影响）。
+            if report:
+                for fragment in _malformed_term_fragments(value):
+                    issues.append(
+                        f'{TERM_AUDIT_PREFIX}"{key}" ({locale}) contains a malformed term placeholder: {fragment}'
+                    )
+
+            if key.startswith("term."):
+                # 3. 术语值必须是纯文本；${param} 是正当用法，不在此列。
+                if report and (TERM_PLAUSIBLE_PATTERN.search(value) or I18NCODE_PATTERN.search(value)):
+                    issues.append(
+                        f'{TERM_AUDIT_PREFIX}term value "{key}" ({locale}) must be plain text '
+                        "but contains a placeholder"
+                    )
+                continue
+
+            # 1. 被引用但基础键缺失：缺失占位符的唯一来源，必须在构建期拦住。
+            for name in _term_references(value):
+                referenced.add(name)
+                if report and base_locale is not None and reader.get(base_locale, f"term.{name}") is None:
+                    issues.append(
+                        f'{TERM_AUDIT_PREFIX}"{key}" ({locale}) references {{TERM:{name}}} '
+                        f'but base key "term.{name}" is missing in base locale "{base_locale}"'
+                    )
+
+    if base_locale is not None:
+        for locale in targets:
+            for key in reader.keys(locale):
+                match = TERM_KEY_PATTERN.fullmatch(key)
+                if match is None or match.group(2) is None:
+                    continue
+                # 4. 声明了变体但基础语言里没有基础键，说明术语词条不完整。
+                if reader.get(base_locale, f"term.{match.group(1)}") is None:
+                    issues.append(
+                        f'{TERM_AUDIT_PREFIX}term variant "{key}" ({locale}) has no base key '
+                        f'"term.{match.group(1)}" in base locale "{base_locale}"'
+                    )
+
+        # 5. 信息级：基础键存在但从未被任何值引用（术语也可能由代码直接调用，故默认关闭）。
+        if include_unreferenced:
+            for key in reader.keys(base_locale):
+                match = TERM_KEY_PATTERN.fullmatch(key)
+                if match is None or match.group(2) is not None or match.group(1) in referenced:
+                    continue
+                issues.append(f'{TERM_AUDIT_PREFIX}term "{key}" in base locale "{base_locale}" is never referenced')
+
+    return list(dict.fromkeys(issues))
+
+
+def audit_terms(locales: Sequence[str] | None = None, *, include_unreferenced: bool = False) -> list[str]:
+    """
+    扫描词条值中的术语引用并返回问题清单（人类可读），无问题返回空列表。
+
+    :param locales: 要检查的语言；None 表示当前快照中的全部语言。
+    :param include_unreferenced: 是否附带「基础术语从未被引用」的信息级条目。（默认为 False）
+    :returns: 问题清单。
+    """
+
+    with _locale_lock:
+        base_source = _store.supported_locales() if _store is not None else tuple(supported_locales)
+    base_locale = base_source[0] if base_source else None
+    return _audit_terms_with(_GlobalLocaleReader(), locales, base_locale, include_unreferenced)
+
+
+def _filter_term_audit_errors(errors: list[str], audit_terms_enabled: bool) -> list[str]:
+    """复用已发布快照时，让 audit_terms=False 依然不返回术语审计条目。"""
+
+    if audit_terms_enabled:
+        return errors
+    return [error for error in errors if not error.startswith(TERM_AUDIT_PREFIX)]
+
+
 def _activate_snapshot(root: Path, manifest: Mapping[str, Any], replace_supported: bool = False) -> str:
     """先建立健康连接，再用一次短临界区替换当前进程的 store。"""
 
@@ -671,14 +882,19 @@ def build_locale_snapshot(
     lang_list: list[str],
     locales_path: list[str],
     namespace: str,
+    *,
+    audit_terms: bool = True,
 ) -> list[str]:
-    """构建并发布命名快照，但不连接或修改当前进程的翻译状态。"""
+    """构建并发布命名快照，但不连接或修改当前进程的翻译状态。
+
+    :param audit_terms: 是否在构建期校验术语引用并并入返回的 errors。（默认为 True）
+    """
 
     languages = tuple(lang_list)
     locales_paths = tuple(locales_path)
     root = _named_snapshot_root(namespace)
     with _load_lock:
-        _, errors = _ensure_snapshot(root, languages, locales_paths)
+        _, errors = _ensure_snapshot(root, languages, locales_paths, audit_terms=audit_terms)
     return errors
 
 
@@ -704,6 +920,8 @@ def load_locale_file(
     lang_list: list[str],
     locales_path: list[str] | None = None,
     reload: bool = False,
+    *,
+    audit_terms: bool = True,
 ) -> list[str]:
     global _connected_namespace
 
@@ -729,7 +947,7 @@ def load_locale_file(
 
         # 已注册来源决定共享 manifest 的位置；普通 load 仍只导入本次传入的路径。
         root = _snapshot_root(registered_languages, registered_paths)
-        manifest, errors = _ensure_snapshot(root, languages, locales_paths)
+        manifest, errors = _ensure_snapshot(root, languages, locales_paths, audit_terms=audit_terms)
         # 构建在锁外完成，最后仅用一次指针/连接交换提交到当前进程。
         _activate_snapshot(root, manifest)
         with _locale_lock:
@@ -797,26 +1015,220 @@ def safe_strftime(dt: Any, fmt: str) -> str:
     return "".join(dt.strftime(token) if is_directive else token for is_directive, token in _split_strftime_format(fmt))
 
 
+def _validate_term_token(token: str) -> str:
+    """候选链 token 必须能直接拼进 `term.<name>.<candidate>`：违规直接抛错，不静默容错。"""
+
+    if not isinstance(token, str) or not token:
+        raise ValueError("Term candidate tokens must be non-empty strings")
+    if any(char in _INVALID_TERM_TOKEN_CHARS or char.isspace() for char in token):
+        raise ValueError(f'Invalid term candidate token: "{token}"')
+    return token
+
+
+def derive_term_candidates(tokens: Sequence[str], *, shared: Sequence[str] = ()) -> tuple[str, ...]:
+    """
+    把「层级作用域 + 共享 token」展开为有序候选链（最具体在前）。
+
+    :param tokens: 会话作用域 token，最外层在前（如 `("discord", "dm", "channel")`）。
+    :param shared: 追加在层级前缀之后、最外层 token 之前的共享 token（如 `("private",)`）。
+    :returns: 去重后的候选链，供 `Locale(term_candidates=...)` 使用。
+    """
+
+    validated = [_validate_term_token(token) for token in tokens]
+    if not validated:
+        raise ValueError("Term candidate tokens cannot be empty")
+    shared_tokens = [_validate_term_token(token) for token in shared]
+
+    candidates = [".".join(validated[:length]) for length in range(len(validated), 1, -1)]
+    candidates.extend(shared_tokens)
+    candidates.append(validated[0])
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+    return tuple(result)
+
+
+def _format_term_placeholder(name: str, params: Mapping[str, object] | None = None) -> str:
+    """还原字面量占位符文本，用于术语缺失时的原样输出与诊断。"""
+
+    suffix = "".join(f",{key}={value}" for key, value in (params or {}).items())
+    return f"{TERM_PLACEHOLDER_PREFIX}{name}{suffix}}}"
+
+
+def _coerce_str_sequence(value: Any, field: str) -> list[str] | None:
+    """容忍缺字段/未知字段地还原状态里的字符串序列。"""
+
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Sequence):
+        return [str(item) for item in value]
+    raise ValueError(f'Locale state field "{field}" must be a sequence of strings or None')
+
+
 class Locale:
     """创建一个本地化对象。"""
 
-    def __init__(self, locale: str, fallback_lng: list[str] | None = None):
+    def __init__(
+        self,
+        locale: str,
+        fallback_lng: list[str] | None = None,
+        *,
+        term_candidates: Sequence[str] | None = None,
+    ) -> None:
+        """
+        :param locale: 语言标签。
+        :param fallback_lng: 回退语言链；为 None 时按当前快照的已声明语言自动推导。
+        :param term_candidates: 有序术语候选链，最具体在前。None 表示未绑定会话作用域，
+            `()` 表示已绑定作用域但没有候选；两者都回落到基础术语 `term.<name>`。
+        """
+
         self.locale = locale
         if fallback_lng is None:
             with _locale_lock:
                 fallback_source = _store.supported_locales() if _store is not None else tuple(supported_locales)
             fallback_lng = [language for language in fallback_source if language != locale]
         self.fallback_lng = fallback_lng
+        self._term_candidates: tuple[str, ...] | None = (
+            None if term_candidates is None else tuple(str(candidate) for candidate in term_candidates)
+        )
 
     @property
     def data(self) -> Mapping[str, str]:
         return _LocaleDataView(self.locale)
+
+    @property
+    def term_candidates(self) -> tuple[str, ...] | None:
+        """只读术语候选链；None 表示该对象未绑定会话作用域。"""
+
+        return self._term_candidates
+
+    @property
+    def term_scoped(self) -> bool:
+        """只读：是否已绑定会话作用域（`term_candidates is not None`）。"""
+
+        return self._term_candidates is not None
 
     def __getitem__(self, key: str) -> str | None:
         return _get_value(self.locale, key)
 
     def __contains__(self, key: str) -> bool:
         return _get_value(self.locale, key) is not None
+
+    def with_locale(self, locale: str) -> "Locale":
+        """换语言渲染，保留术语候选链与回退链（不要用 `Locale(tag)` 重新构造）。
+
+        回退链里指向新语言自身的项没有意义（新语言查不到时会原地回退），
+        因此把它换成派生前的语言，保证换语言渲染仍能回退到会话语言。
+        """
+
+        fallback_lng = list(self.fallback_lng)
+        if locale in fallback_lng:
+            fallback_lng = [language for language in fallback_lng if language != locale]
+            if self.locale != locale and self.locale not in fallback_lng:
+                fallback_lng.append(self.locale)
+        return type(self)(locale, fallback_lng, term_candidates=self._term_candidates)
+
+    def with_term_candidates(self, candidates: Sequence[str] | None) -> "Locale":
+        """换术语候选链，保留语言与其他设置；传 None 表示解绑作用域。"""
+
+        return type(self)(self.locale, list(self.fallback_lng), term_candidates=candidates)
+
+    def to_state(self) -> dict[str, Any]:
+        """导出可跨进程/RPC 传递的状态；字段只增不改。"""
+
+        return {
+            "locale": self.locale,
+            "fallback_lng": list(self.fallback_lng),
+            "term_candidates": None if self._term_candidates is None else list(self._term_candidates),
+        }
+
+    @classmethod
+    def from_state(cls, state: Mapping[str, Any]) -> "Locale":
+        """从 `to_state()` 的结果还原；容忍缺字段、未知字段与旧版 `{"locale": ...}` 表示。"""
+
+        locale = state.get("locale")
+        if not isinstance(locale, str) or not locale:
+            raise ValueError('Locale state must contain a non-empty "locale" string')
+        fallback_lng = _coerce_str_sequence(state.get("fallback_lng"), "fallback_lng")
+        term_candidates = _coerce_str_sequence(state.get("term_candidates"), "term_candidates")
+        return cls(locale, fallback_lng, term_candidates=term_candidates)
+
+    def _lookup_term(self, name: str) -> tuple[str, str] | None:
+        """按候选链查找术语，返回 `(命中的键, 术语文本)`；未命中返回 None。
+
+        变体只在本语言中查找（不进入回退链），基础键走正常回退语义。
+        """
+
+        with _locale_lock:
+            if self._term_candidates is not None:
+                for candidate in self._term_candidates:
+                    key = f"term.{name}.{candidate}"
+                    value = _get_value(self.locale, key)
+                    if value is not None:
+                        return key, value
+
+            base_key = f"term.{name}"
+            for language in (self.locale, *self.fallback_lng):
+                value = _get_value(language, base_key)
+                if value is not None:
+                    return base_key, value
+        return None
+
+    def term_key(self, name: str) -> str | None:
+        """返回术语命中的词条键（诊断用）；术语不存在时返回 None。"""
+
+        found = self._lookup_term(name)
+        return None if found is None else found[0]
+
+    def term(self, name: str | None = None, /, **params: object) -> str:
+        """
+        解析单个术语；参数只用于向术语文本插值。
+
+        :param name: 术语名（`term.<name>` 里的 `<name>`）。声明为仅位置参数，
+            这样 `name` 也能作为占位符参数名（`{TERM:target,name=群聊}`）使用；
+            `term(name="target")` 这种关键字写法同样被接受。
+        :returns: 术语文本；术语不存在时返回原样占位符文本 `{TERM:name,...}`。
+        """
+
+        if name is None:
+            name = params.pop("name", None)
+            if name is None:
+                raise TypeError("term() missing 1 required argument: 'name'")
+
+        found = self._lookup_term(name)
+        if found is None:
+            return _format_term_placeholder(name, params)
+        return self._render_term(found[1], params)
+
+    @staticmethod
+    def _render_term(text: str, params: Mapping[str, object]) -> str:
+        """把占位符自带的参数插值进术语文本；缺参数时 `${...}` 原样保留，不报错。"""
+
+        return Template(text).safe_substitute(**params) if params else text
+
+    def _resolve_terms(self, text: str) -> str:
+        """单趟替换文本中的 `{TERM:...}` 占位符；未命中的占位符原样保留（含参数）。"""
+
+        # 快速路径：绝大多数文案不含占位符，避免正则开销。
+        if TERM_PLACEHOLDER_PREFIX not in text:
+            return text
+
+        def replace_term(match: re.Match[str]) -> str:
+            found = self._lookup_term(match.group(1))
+            if found is None:
+                # 原样保留：连重名参数、书写顺序都逐字节不变。
+                return match.group(0)
+            params_str = match.group(2)
+            params = dict(TERM_PARAM_PATTERN.findall(params_str)) if params_str else {}
+            return self._render_term(found[1], params)
+
+        return TERM_PATTERN.sub(replace_term, text)
 
     @staticmethod
     def reload() -> list[str]:
@@ -870,17 +1282,22 @@ class Locale:
         with _locale_lock:
             if isinstance(key, dict):
                 if translated := key.get(self.locale):
-                    return str(translated)
+                    return self._resolve_terms(str(translated))
                 if fallback and "_fallback_locale" in key:
-                    return str(key["_fallback_locale"])
-                return str(key) + self.t(
-                    "error.i18n.fallback",
-                    locale_failed_prompt=False,
-                    _fallback_locale=self.locale,
+                    return self._resolve_terms(str(key["_fallback_locale"]))
+                return self._resolve_terms(
+                    str(key)
+                    + self.t(
+                        "error.i18n.fallback",
+                        locale_failed_prompt=False,
+                        _fallback_locale=self.locale,
+                    )
                 )
 
             localized = self.get_string_with_fallback(key, fallback, locale_failed_prompt)
-            return Template(localized).safe_substitute(**kwargs)
+            # 先做调用方 kwargs 插值，再解析术语：kwarg 值里的占位符也会生效，
+            # 而术语占位符自带的参数只作用于术语文本。
+            return self._resolve_terms(Template(localized).safe_substitute(**kwargs))
 
     def t_str(
         self,
@@ -922,11 +1339,15 @@ class Locale:
                 )
                 return translated if isinstance(translated, str) else full
 
+            # 先解析输入文本里的术语；术语文本按纯文本插入，其中的占位符不会被二次扫描
+            # （构建期由 audit_terms() 报错），因此术语替换不计入 {I18N:} 的递归深度。
+            text = self._resolve_terms(text)
+
             previous_text = None
             depth = 0
             while previous_text != text and depth < MAX_I18NCODE_DEPTH:
                 previous_text = text
-                text = re.sub(r"\{I18N:([^\s,{}]+)(?:,([^{}]*))?}", match_i18ncode, text)
+                text = I18NCODE_PATTERN.sub(match_i18ncode, text)
                 depth += 1
             return text
 
@@ -947,10 +1368,9 @@ class Locale:
         :param locale_failed_prompt: 是否添加本地化失败提示。（默认为 True）
         :returns: 格式化后的字符串。
         """
-        return safe_strftime(
-            dt,
-            self.t(key, fallback=fallback, locale_failed_prompt=locale_failed_prompt, **kwargs),
-        )
+        # 格式串不参与术语解析（占位符只用于文案值）。
+        localized = self.get_string_with_fallback(key, fallback, locale_failed_prompt)
+        return safe_strftime(dt, Template(localized).safe_substitute(**kwargs))
 
 
 def _reset_state_for_testing() -> None:
@@ -967,8 +1387,10 @@ def _reset_state_for_testing() -> None:
 
 __all__ = [
     "Locale",
+    "audit_terms",
     "build_locale_snapshot",
     "connect_locale_snapshot",
+    "derive_term_candidates",
     "get_available_locales",
     "load_locale_file",
     "safe_strftime",
