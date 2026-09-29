@@ -11,7 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from string import Template
 from threading import RLock
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import orjson
 
@@ -37,10 +37,17 @@ TERM_PLAUSIBLE_PATTERN = re.compile(
 # 形如术语占位符的片段（大小写不敏感），用于构建期审计；合法的占位符会被排除。
 TERM_LIKE_PATTERN = re.compile(r"\{[Tt][Ee][Rr][Mm]:(?:[^{}$]|\$(?!\{)|\$\{[^{}]*\})*\}?")
 # term.<name> 或 term.<name>.<candidate>（candidate 本身可以再含点）。
+TERM_KEY_PREFIX = "term."
 TERM_KEY_PATTERN = re.compile(r"term\.([a-z][a-z0-9_]*)(?:\.(.+))?")
 I18NCODE_PATTERN = re.compile(r"\{I18N:([^\s,{}]+)(?:,([^{}]*))?\}")
 # 术语审计条目统一前缀，便于调用方在 errors 列表里识别，并让 audit_terms=False 在复用缓存时依然生效。
 TERM_AUDIT_PREFIX = "[term] "
+# 每个语言目录下的术语子目录：<locales>/terms/<locale>.json 只存放术语词条，
+# 与一般语义词条分开维护。目录内的键默认省略 `term.` 前缀（写成 `target.private` 即可），
+# 已经带前缀的写法同样接受，便于把术语从一般词条文件里整段搬过来。
+TERMS_DIRECTORY_NAME = "terms"
+_SOURCE_CATEGORY_LOCALE = "locale"
+_SOURCE_CATEGORY_TERMS = "terms"
 # 派生候选链时 token 不允许出现的字符：它们会破坏键名或占位符语法。
 _INVALID_TERM_TOKEN_CHARS = frozenset(".{}:")
 
@@ -345,25 +352,47 @@ class _LocaleDataRegistry(Mapping[str, Mapping[str, str]]):
 locale_data: Mapping[str, Mapping[str, str]] = _LocaleDataRegistry()
 
 
-def _source_files(locales_paths: tuple[str, ...]) -> tuple[Path, ...]:
-    result: list[Path] = []
+class _LocaleSource(NamedTuple):
+    """一个语言来源文件；`terms` 标记它是否来自术语子目录。"""
+
+    path: Path
+    terms: bool
+
+
+def _source_files(locales_paths: tuple[str, ...]) -> tuple[_LocaleSource, ...]:
+    """扫描语言目录：顶层 *.json 是一般词条，`terms/` 子目录（可再分层）里的 *.json 是术语词条。"""
+
+    result: list[_LocaleSource] = []
     seen: set[Path] = set()
+
+    def add(candidate: Path, is_terms: bool) -> None:
+        if not candidate.is_file() or candidate.suffix != ".json":
+            return
+        resolved = candidate.resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        result.append(_LocaleSource(resolved, is_terms))
+
     for locales_path in locales_paths:
         directory = Path(locales_path)
         if not directory.is_dir():
             continue
         for candidate in sorted(directory.iterdir(), key=lambda path: path.name):
-            if not candidate.is_file() or candidate.suffix != ".json":
-                continue
-            resolved = candidate.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                result.append(resolved)
+            add(candidate, False)
+        terms_directory = directory / TERMS_DIRECTORY_NAME
+        if terms_directory.is_dir():
+            # 术语目录允许再分子目录（如 terms/platform/zh_cn.json），文件名仍然是语言标签。
+            for candidate in sorted(
+                terms_directory.rglob("*.json"),
+                key=lambda path: path.relative_to(terms_directory).as_posix(),
+            ):
+                add(candidate, True)
     return tuple(result)
 
 
 def _source_signature(
-    languages: tuple[str, ...], locales_paths: tuple[str, ...], source_files: tuple[Path, ...]
+    languages: tuple[str, ...], locales_paths: tuple[str, ...], source_files: tuple[_LocaleSource, ...]
 ) -> str:
     digest = hashlib.sha256()
     for language in languages:
@@ -374,7 +403,8 @@ def _source_signature(
         digest.update(b"path\0")
         digest.update(str(Path(locales_path).resolve()).encode("utf-8"))
         digest.update(b"\0")
-    for source_file in source_files:
+    for source in source_files:
+        source_file = source.path
         stat = source_file.stat()
         digest.update(str(source_file).encode("utf-8"))
         digest.update(f"\0{stat.st_size}\0{stat.st_mtime_ns}\0".encode())
@@ -382,6 +412,12 @@ def _source_signature(
         digest.update(source_file.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def _normalize_term_key(key: str) -> str:
+    """术语文件里的键默认省略 `term.` 前缀；已带前缀的写法保持不变。"""
+
+    return key if key.startswith(TERM_KEY_PREFIX) else f"{TERM_KEY_PREFIX}{key}"
 
 
 def _snapshot_cache_base() -> Path:
@@ -415,7 +451,7 @@ def _named_snapshot_root(namespace: str) -> Path:
 def _build_snapshot(
     root: Path,
     languages: tuple[str, ...],
-    source_files: tuple[Path, ...],
+    source_files: tuple[_LocaleSource, ...],
     source_signature: str,
     audit_terms: bool = True,
 ) -> tuple[Path, dict[str, Any]]:
@@ -440,7 +476,8 @@ def _build_snapshot(
                 locale TEXT NOT NULL,
                 key TEXT NOT NULL,
                 value TEXT NOT NULL,
-                source TEXT NOT NULL
+                source TEXT NOT NULL,
+                category TEXT NOT NULL
             );
             CREATE TABLE locales (
                 locale TEXT PRIMARY KEY,
@@ -450,8 +487,10 @@ def _build_snapshot(
         )
 
         locale_position = 0
-        for source_file in source_files:
+        for source in source_files:
+            source_file = source.path
             locale = source_file.stem
+            category = _SOURCE_CATEGORY_TERMS if source.terms else _SOURCE_CATEGORY_LOCALE
             # 单文件使用 savepoint；解析失败时不会把该文件的半批数据写入快照。
             connection.execute("SAVEPOINT locale_file")
             try:
@@ -464,12 +503,18 @@ def _build_snapshot(
                     (locale, locale_position),
                 )
                 rows = (
-                    (locale, key, str(value), str(source_file))
+                    (
+                        locale,
+                        _normalize_term_key(key) if source.terms else key,
+                        str(value),
+                        str(source_file),
+                        category,
+                    )
                     for key, value in flatten(raw_data).items()
                     if value is not None
                 )
                 connection.executemany(
-                    "INSERT INTO raw_translations(locale, key, value, source) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO raw_translations(locale, key, value, source, category) VALUES (?, ?, ?, ?, ?)",
                     rows,
                 )
                 connection.execute("RELEASE SAVEPOINT locale_file")
@@ -492,12 +537,27 @@ def _build_snapshot(
             """
         ).fetchall()
         for locale, key in conflicts:
-            errors.append(f'Conflict detected for key "{key}":')
             sources = connection.execute(
-                "SELECT source FROM raw_translations WHERE locale = ? AND key = ? ORDER BY position",
+                "SELECT source, category FROM raw_translations WHERE locale = ? AND key = ? ORDER BY position",
                 (locale, key),
             ).fetchall()
-            errors.extend(str(source[0]) for source in sources)
+            term_sources = [str(source) for source, category in sources if category == _SOURCE_CATEGORY_TERMS]
+            if len(term_sources) == 1:
+                # 术语目录是术语的归属地：同名的一般词条按“尚未搬迁的旧副本”处理，由术语文件胜出。
+                # 仍然报出来，避免同一术语在两处长期各写一份。
+                connection.execute(
+                    "DELETE FROM raw_translations WHERE locale = ? AND key = ? AND category != ?",
+                    (locale, key, _SOURCE_CATEGORY_TERMS),
+                )
+                if audit_terms:
+                    stale = [str(source) for source, category in sources if category != _SOURCE_CATEGORY_TERMS]
+                    errors.append(
+                        f'{TERM_AUDIT_PREFIX}"{key}" is also defined in {", ".join(stale)}; '
+                        f"using the terms directory definition in {term_sources[0]}"
+                    )
+                continue
+            errors.append(f'Conflict detected for key "{key}":')
+            errors.extend(str(source) for source, _category in sources)
 
         # 只把无冲突记录写入最终只读表，然后删除包含冗余来源信息的 staging 表。
         connection.executescript(

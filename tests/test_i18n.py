@@ -407,6 +407,15 @@ class _LocaleFixture(unittest.TestCase):
         directory.mkdir(parents=True, exist_ok=True)
         (directory / f"{locale}.json").write_bytes(orjson.dumps(data))
 
+    def write_terms_file(self, directory: Path, locale: str, data: dict, subdirectory: str = "") -> None:
+        """写入 <locales>/terms/[<subdirectory>/]<locale>.json。"""
+
+        terms = directory / i18n.TERMS_DIRECTORY_NAME
+        if subdirectory:
+            terms = terms / subdirectory
+        terms.mkdir(parents=True, exist_ok=True)
+        (terms / f"{locale}.json").write_bytes(orjson.dumps(data))
+
     def load(self, languages: list[str], directory: Path | None = None, **kwargs: Any) -> list[str]:
         return i18n.load_locale_file(languages, [str(directory or self.locales)], **kwargs)
 
@@ -936,6 +945,129 @@ class TermAuditTests(_LocaleFixture):
         # 引用发生在 zh_cn，只检查 en_us 时不应把 term.target 误判为“从未被引用”。
         self.assertEqual(i18n.audit_terms(["en_us"], include_unreferenced=True), [])
         self.assertEqual(i18n.audit_terms(include_unreferenced=True), [])
+
+
+class TermDirectoryTests(_LocaleFixture):
+    """<locales>/terms/ 是术语的专属来源，与一般语义词条分开维护。"""
+
+    def test_terms_directory_defines_terms_without_the_prefix(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"core.help.bind.channel": "查看当前{TERM:target}的消息通道。"})
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景", "target.qq.group": "群聊"})
+
+        self.assertEqual(self.load(["zh_cn"]), [])
+
+        locale = i18n.Locale("zh_cn", term_candidates=("qq.group", "qq"))
+
+        self.assertEqual(locale.t("core.help.bind.channel"), "查看当前群聊的消息通道。")
+        self.assertEqual(locale.term_key("target"), "term.target.qq.group")
+        # 术语仍然落在同一个词条命名空间里，查表接口不变。
+        self.assertEqual(locale["term.target"], "场景")
+
+    def test_prefixed_and_nested_keys_are_accepted(self) -> None:
+        self.write_terms_file(
+            self.locales,
+            "zh_cn",
+            {"term.target": "场景", "target": {"private": "私聊"}, "target.discord": "频道"},
+        )
+        self.assertEqual(self.load(["zh_cn"]), [])
+
+        locale = i18n.Locale("zh_cn")
+
+        self.assertEqual(locale.term("target"), "场景")
+        self.assertEqual(i18n.Locale("zh_cn", term_candidates=("private",)).term("target"), "私聊")
+        self.assertEqual(i18n.Locale("zh_cn", term_candidates=("discord",)).term("target"), "频道")
+
+    def test_nested_subdirectories_are_scanned(self) -> None:
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"}, subdirectory="platform")
+        self.write_terms_file(self.locales, "zh_cn", {"target.discord": "频道"}, subdirectory="platform/discord")
+
+        self.assertEqual(self.load(["zh_cn"]), [])
+
+        locale = i18n.Locale("zh_cn", term_candidates=("discord",))
+
+        self.assertEqual(locale.term("target"), "频道")
+
+    def test_terms_from_multiple_locale_directories_merge(self) -> None:
+        bots = self.root / "bots-locales"
+        self.write_locale(self.locales, "zh_cn", {"value": "当前{TERM:target}"})
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"})
+        self.write_terms_file(bots, "zh_cn", {"target.discord": "频道"})
+
+        self.assertEqual(i18n.load_locale_file(["zh_cn"], [str(self.locales), str(bots)]), [])
+        self.assertEqual(i18n.Locale("zh_cn", term_candidates=("discord",)).t("value"), "当前频道")
+
+    def test_general_file_copy_is_superseded_by_the_terms_directory(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"value": "当前{TERM:target}", "term.target": "旧场景"})
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"})
+
+        errors = self.load(["zh_cn"])
+
+        # 迁移期间不静默：两份定义都会被指出，实际生效的是术语目录里的那份。
+        self.assert_term_issues(errors, "term.target", "terms directory", str(self.locales / "zh_cn.json"))
+        self.assertEqual(i18n.Locale("zh_cn").t("value"), "当前场景")
+        # 与其它术语诊断一致，audit_terms=False 时该条目也不出现。
+        self.assertEqual(self.load(["zh_cn"], audit_terms=False), [])
+
+    def test_two_terms_files_still_conflict(self) -> None:
+        other = self.root / "other-locales"
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"})
+        self.write_terms_file(other, "zh_cn", {"target": "另一个场景"})
+
+        errors = i18n.load_locale_file(["zh_cn"], [str(self.locales), str(other)])
+
+        self.assertTrue(any('Conflict detected for key "term.target"' in error for error in errors))
+        self.assertIsNone(i18n.Locale("zh_cn")["term.target"])
+
+    def test_terms_only_locale_is_loaded(self) -> None:
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"})
+
+        self.assertEqual(self.load(["zh_cn"]), [])
+        self.assertIn("zh_cn", i18n.get_available_locales())
+        self.assertEqual(i18n.Locale("zh_cn").term("target"), "场景")
+
+    def test_audit_sees_terms_from_the_directory(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"value": "当前{TERM:target}", "bad": "{TERM:missing}"})
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景", "broken": "{TERM:target}"})
+
+        errors = self.load(["zh_cn"])
+
+        # 术语目录里的定义参与“基础键缺失”判定；目录里的术语值同样要接受纯文本校验。
+        self.assert_term_issues(errors, "term.missing", 'term value "term.broken"')
+        self.assertFalse(any("term.target" in error and "missing" in error for error in errors))
+
+    def test_reload_picks_up_terms_directory_changes(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"value": "当前{TERM:target}"})
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景"})
+        self.assertEqual(self.load(["zh_cn"]), [])
+
+        locale = i18n.Locale("zh_cn", term_candidates=("qq.group", "qq"))
+        self.assertEqual(locale.t("value"), "当前场景")
+
+        self.write_terms_file(self.locales, "zh_cn", {"target": "场景", "target.qq.group": "群聊"})
+
+        self.assertEqual(i18n.Locale.reload(), [])
+        self.assertEqual(locale.t("value"), "当前群聊")
+
+    def test_missing_terms_directory_and_unrelated_files_are_ignored(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"term.target": "场景", "value": "当前{TERM:target}"})
+        (self.locales / "notes.txt").write_text("ignored")
+        (self.locales / i18n.TERMS_DIRECTORY_NAME).mkdir()
+        (self.locales / i18n.TERMS_DIRECTORY_NAME / "notes.txt").write_text("ignored")
+
+        self.assertEqual(self.load(["zh_cn"]), [])
+        self.assertEqual(i18n.Locale("zh_cn").t("value"), "当前场景")
+
+    def test_broken_terms_file_is_reported(self) -> None:
+        self.write_locale(self.locales, "zh_cn", {"value": "plain"})
+        terms = self.locales / i18n.TERMS_DIRECTORY_NAME
+        terms.mkdir()
+        (terms / "zh_cn.json").write_bytes(b"{")
+
+        with redirect_stderr(StringIO()):
+            errors = self.load(["zh_cn"])
+
+        self.assertTrue(any("Failed to load" in error and "terms" in error for error in errors))
+        self.assertEqual(i18n.Locale("zh_cn").t("value"), "plain")
 
 
 class TermBuildIntegrationTests(_LocaleFixture):

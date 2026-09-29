@@ -38,6 +38,8 @@ connect_locale_snapshot("akari-bot")
 }
 ```
 
+术语词条推荐放在每个语言目录下的 `terms/` 子目录里，与一般语义词条分开维护（见下一节）。
+
 文案作者只写 `{TERM:<name>}`，不接触变体键名。占位符可携带参数，参数只用于向术语文本插值（`${...}` 缺参数时原样保留），不参与变体选择：
 
 ```json
@@ -76,6 +78,42 @@ locale.t("core.help.bind.channel", channel=3)  # -> 查看当前私聊的消息�
 | `to_state()` / `Locale.from_state(state)` | 跨进程/RPC 传递状态；字段只增不改，容忍缺字段与未知字段 |
 
 术语在 `t()`（含 dict 分支）与 `t_str()` 中解析，因此所有渲染路径自动生效；`strftime` 的格式串、`__getitem__` / `__contains__` / `data` 不解析术语。
+
+### 术语目录（terms/）
+
+术语是独立的一类词条，默认与一般语义词条混在同一个语言文件里。要分开维护，在每个语言目录下新建 `terms/` 子目录，按语言放文件即可：
+
+```
+core/locales/
+├── zh_cn.json                 # 一般语义词条
+└── terms/
+    └── zh_cn.json             # 术语词条
+bots/discord/locales/
+├── zh_cn.json
+└── terms/
+    └── zh_cn.json             # 该平台独有的术语
+```
+
+`terms/` 里的键默认**省略 `term.` 前缀**，写成术语名本身；已经带前缀的写法同样接受，方便把术语从一般词条文件里整段搬过来。嵌套对象会先扁平化，键里的点号继续表示层级：
+
+```json
+{
+  "target": "场景",
+  "target.private": "私聊",
+  "target": {"discord": "频道"},
+  "term.target.qq.group": "群聊"
+}
+```
+
+以上等价于 `term.target`、`term.target.private`、`term.target.discord`、`term.target.qq.group`。`terms/` 下可以再分子目录（如 `terms/platform/zh_cn.json`）用于分组，文件名始终是语言标签。
+
+约定：
+
+- 没有 `terms/` 目录时行为与以前完全一致；一般语言文件里继续写 `term.*` 也照常生效。
+- 术语目录是术语的归属地：同一个键同时出现在一般文件和 `terms/` 里时，**以 `terms/` 为准**，并作为术语审计条目报出（提示删除旧副本），因此“先复制、后删除”的迁移过程不会让术语失效。
+- 两个 `terms/` 文件（例如两个平台适配器）声明同一个键仍然是冲突：该键的所有副本都会被丢弃并报错，与既有规则一致。
+- 术语文件参与内容签名，改动会触发快照重建；解析失败与一般文件一样报 `Failed to load`。
+- 术语仍然落在同一个 `term.` 词条命名空间，`Locale` 的查表与候选链逻辑不变。
 
 ### 术语校验
 
