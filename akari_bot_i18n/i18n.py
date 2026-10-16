@@ -1282,11 +1282,44 @@ class Locale:
         def replace_term(match: re.Match[str]) -> str:
             found = self._lookup_term(match.group(1))
             if found is None:
-                # 原样保留：连重名参数、书写顺序都逐字节不变。
+                # 术语不存在时，原样保留占位符
                 return match.group(0)
+
             params_str = match.group(2)
             params = dict(TERM_PARAM_PATTERN.findall(params_str)) if params_str else {}
-            return self._render_term(found[1], params)
+      
+            # style 是保留参数，不传给术语插值逻辑
+            style = params.pop("style", "").strip().lower()
+
+            # 先处理 count 等其他参数，再转换大小写
+            value = self._render_term(found[1], params)
+
+            style_aliases = {
+                "t": "title",
+                "title": "title",
+                "u": "upper",
+                "upper": "upper",
+                "l": "lower",
+                "lower": "lower",
+                "c": "capitalize",
+                "capitalize": "capitalize",
+                "s": "swapcase",
+                "swapcase": "swapcase",
+            }
+
+            style = style_aliases.get(style)
+
+            if style == "title":
+                value = value.title()
+            elif style == "upper":
+                value = value.upper()
+            elif style == "lower":
+                value = value.lower()
+            elif style == "capitalize":
+                value = value.capitalize()
+            elif style == "swapcase":
+                value = value.swapcase()
+            return value
 
         return TERM_PATTERN.sub(replace_term, text)
 
